@@ -120,16 +120,18 @@ int main(int argc, char **argv) {
                     printf("Invalid seats\n");
                     continue;
                 }
-                int booking_result = book_seats(current_user, source, destination, day, month, year, seats);
+                int booking_result = book_seats(source, destination, day, month, year, seats);
                 if (booking_result == 0) {
                     printf("Booking OK\n");
+                } else if (booking_result == BOOK_SEATS_WAITLISTED) {
+                    printf("Flight is full. You were added to the waitlist and will be booked when a new flight on this route is created.\n");
                 } else if (booking_result == BOOK_SEATS_ADMIN_REQUESTED) {
                     printf("Flight unavailable. Creation request sent to admins\n");
                 } else {
                     printf("Booking failed\n");
                 }
             } else if (choice == 4) {
-                if (view_my_bookings(current_user) != 0) {
+                if (view_my_bookings() != 0) {
                     printf("Failed to fetch bookings\n");
                 }
             } else if (choice == 5) {
@@ -139,6 +141,7 @@ int main(int argc, char **argv) {
             } else if (choice == 6) {
                 authenticated = false;
                 current_user[0] = '\0';
+                client_logout();
                 printf("Logged out\n");
             } else if (choice == 7) {
                 break;

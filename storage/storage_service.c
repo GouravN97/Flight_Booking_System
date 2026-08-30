@@ -30,7 +30,7 @@ typedef struct flight_persist {
 typedef struct admin_persist {
     int in_use;
     char admin_id[64];
-    char password[64];
+    char password[PASSWORD_HASH_SIZE];
     char message[256];
 } AdminPersist;
 
@@ -476,11 +476,133 @@ int storage_delete_booking(int flight_index, int booking_index) {
     return rc;
 }
 
+static int open_locked_db(const char *db_name, int record_size, int *lock_fd_out) {
+    if (lock_db_file(db_name, F_WRLCK, lock_fd_out) != 0) {
+        return -1;
+    }
+    if (open_db((char *)db_name, record_size) != 0) {
+        unlock_db_file(*lock_fd_out);
+        return -1;
+    }
+    return 0;
+}
+
+int storage_write_waitlist_entry(ServerState *state, int index) {
+    if (state == NULL || index < 0 || index >= MAX_WAITLIST) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_db_api_lock);
+    int lock_fd = -1;
+    if (open_locked_db(WAITLIST_DB_FILE, (int)sizeof(WaitlistEntry), &lock_fd) != 0) {
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    int rc = update_db((char *)WAITLIST_DB_FILE, index, &state->waitlist[index]);
+    if (close_db((char *)WAITLIST_DB_FILE) != 0) {
+        rc = -1;
+    }
+    unlock_db_file(lock_fd);
+    pthread_mutex_unlock(&g_db_api_lock);
+    return rc;
+}
+
+int storage_delete_waitlist_entry(int index) {
+    if (index < 0 || index >= MAX_WAITLIST) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_db_api_lock);
+    int lock_fd = -1;
+    if (open_locked_db(WAITLIST_DB_FILE, (int)sizeof(WaitlistEntry), &lock_fd) != 0) {
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    int rc = delete_db((char *)WAITLIST_DB_FILE, index);
+    if (close_db((char *)WAITLIST_DB_FILE) != 0) {
+        rc = -1;
+    }
+    unlock_db_file(lock_fd);
+    pthread_mutex_unlock(&g_db_api_lock);
+    return rc;
+}
+
+int storage_write_notification_entry(ServerState *state, int index) {
+    if (state == NULL || index < 0 || index >= MAX_NOTIFICATIONS) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_db_api_lock);
+    int lock_fd = -1;
+    if (open_locked_db(NOTIFICATIONS_DB_FILE, (int)sizeof(UserNotification), &lock_fd) != 0) {
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    int rc = update_db((char *)NOTIFICATIONS_DB_FILE, index, &state->notifications[index]);
+    if (close_db((char *)NOTIFICATIONS_DB_FILE) != 0) {
+        rc = -1;
+    }
+    unlock_db_file(lock_fd);
+    pthread_mutex_unlock(&g_db_api_lock);
+    return rc;
+}
+
+int storage_delete_notification_entry(int index) {
+    if (index < 0 || index >= MAX_NOTIFICATIONS) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_db_api_lock);
+    int lock_fd = -1;
+    if (open_locked_db(NOTIFICATIONS_DB_FILE, (int)sizeof(UserNotification), &lock_fd) != 0) {
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    int rc = delete_db((char *)NOTIFICATIONS_DB_FILE, index);
+    if (close_db((char *)NOTIFICATIONS_DB_FILE) != 0) {
+        rc = -1;
+    }
+    unlock_db_file(lock_fd);
+    pthread_mutex_unlock(&g_db_api_lock);
+    return rc;
+}
+
+static int load_waitlist_record(uint32_t key, void *record, void *ctx) {
+    ServerState *state = ((StorageLoadCtx *)ctx)->state;
+    if (key >= (uint32_t)MAX_WAITLIST) {
+        return 0;
+    }
+    WaitlistEntry *entry = (WaitlistEntry *)record;
+    if (!entry->in_use) {
+        return 0;
+    }
+    state->waitlist[(int)key] = *entry;
+    int next = ((int)key + 1) % MAX_WAITLIST;
+    if (state->next_waitlist_slot == (int)key) {
+        state->next_waitlist_slot = next;
+    }
+    if (entry->seq + 1 > state->next_waitlist_seq) {
+        state->next_waitlist_seq = entry->seq + 1;
+    }
+    return 0;
+}
+
+static int load_notification_record(uint32_t key, void *record, void *ctx) {
+    ServerState *state = ((StorageLoadCtx *)ctx)->state;
+    if (key >= (uint32_t)MAX_NOTIFICATIONS) {
+        return 0;
+    }
+    UserNotification *entry = (UserNotification *)record;
+    if (!entry->in_use) {
+        return 0;
+    }
+    state->notifications[(int)key] = *entry;
+    return 0;
+}
+
 int storage_init(ServerState *state) {
     if (ensure_db(FLIGHTS_DB_FILE, MAX_FLIGHTS, (int)sizeof(FlightPersist)) != 0 ||
         ensure_db(ADMINS_DB_FILE, MAX_ADMINS, (int)sizeof(AdminPersist)) != 0 ||
         ensure_db(USERS_DB_FILE, MAX_USERS, (int)sizeof(UserEntry)) != 0 ||
-        ensure_db(BOOKINGS_DB_FILE, MAX_FLIGHTS * MAX_BOOKINGS_PER_FLIGHT, (int)sizeof(BookingRecord)) != 0) {
+        ensure_db(BOOKINGS_DB_FILE, MAX_FLIGHTS * MAX_BOOKINGS_PER_FLIGHT, (int)sizeof(BookingRecord)) != 0 ||
+        ensure_db(WAITLIST_DB_FILE, MAX_WAITLIST, (int)sizeof(WaitlistEntry)) != 0 ||
+        ensure_db(NOTIFICATIONS_DB_FILE, MAX_NOTIFICATIONS, (int)sizeof(UserNotification)) != 0) {
         return -1;
     }
 
@@ -574,6 +696,53 @@ int storage_init(ServerState *state) {
     int rc = close_db(BOOKINGS_DB_FILE);
     unlock_db_file(bookings_lock_fd);
     int migrate_bookings = load_ctx.legacy_records_migrated;
+
+    int waitlist_lock_fd = -1;
+    if (lock_db_file(WAITLIST_DB_FILE, F_RDLCK, &waitlist_lock_fd) != 0) {
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    if (open_db(WAITLIST_DB_FILE, (int)sizeof(WaitlistEntry)) != 0) {
+        unlock_db_file(waitlist_lock_fd);
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    if (foreach_record(load_waitlist_record, &load_ctx) != 0) {
+        close_db(WAITLIST_DB_FILE);
+        unlock_db_file(waitlist_lock_fd);
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    if (close_db(WAITLIST_DB_FILE) != 0) {
+        unlock_db_file(waitlist_lock_fd);
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    unlock_db_file(waitlist_lock_fd);
+
+    int notifications_lock_fd = -1;
+    if (lock_db_file(NOTIFICATIONS_DB_FILE, F_RDLCK, &notifications_lock_fd) != 0) {
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    if (open_db(NOTIFICATIONS_DB_FILE, (int)sizeof(UserNotification)) != 0) {
+        unlock_db_file(notifications_lock_fd);
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    if (foreach_record(load_notification_record, &load_ctx) != 0) {
+        close_db(NOTIFICATIONS_DB_FILE);
+        unlock_db_file(notifications_lock_fd);
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    if (close_db(NOTIFICATIONS_DB_FILE) != 0) {
+        unlock_db_file(notifications_lock_fd);
+        pthread_mutex_unlock(&g_db_api_lock);
+        return -1;
+    }
+    unlock_db_file(notifications_lock_fd);
+
     pthread_mutex_unlock(&g_db_api_lock);
 
     if (migrate_bookings) {

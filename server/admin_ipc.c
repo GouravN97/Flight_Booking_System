@@ -1,4 +1,5 @@
 #include "admin_ipc.h"
+#include "password.h"
 #include "storage_service.h"
 #include <stdio.h>
 #include <string.h>
@@ -104,7 +105,10 @@ int create_admin_user(ServerState *state, const char *admin_id, const char *pass
 
     state->admins[slot].in_use = 1;
     snprintf(state->admins[slot].admin_id, sizeof(state->admins[slot].admin_id), "%s", admin_id);
-    snprintf(state->admins[slot].password, sizeof(state->admins[slot].password), "%s", password);
+    if (hash_password(password, state->admins[slot].password, sizeof(state->admins[slot].password)) != 0) {
+        memset(&state->admins[slot], 0, sizeof(state->admins[slot]));
+        return -1;
+    }
     state->admins[slot].message[0] = '\0';
     return storage_flush_admins(state);
 }
@@ -113,17 +117,14 @@ int verify_admin_user(ServerState *state, const char *admin_id, const char *pass
     if (admin_id == NULL || password == NULL) {
         return -1;
     }
-    if (strncmp(admin_id, "admin", 64) == 0 && strncmp(password, "admin123", 64) == 0) {
-        return 0;
-    }
     for (int i = 0; i < MAX_ADMINS; i++) {
         if (!state->admins[i].in_use) {
             continue;
         }
-        if (strncmp(state->admins[i].admin_id, admin_id, sizeof(state->admins[i].admin_id)) == 0 &&
-            strncmp(state->admins[i].password, password, sizeof(state->admins[i].password)) == 0) {
-            return 0;
+        if (strncmp(state->admins[i].admin_id, admin_id, sizeof(state->admins[i].admin_id)) != 0) {
+            continue;
         }
+        return verify_password(password, state->admins[i].password);
     }
     return -1;
 }

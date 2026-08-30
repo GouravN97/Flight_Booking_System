@@ -1,6 +1,7 @@
 #include "flight_service.h"
 #include "admin_ipc.h"
 #include "storage_service.h"
+#include "waitlist_service.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -102,7 +103,11 @@ int create_flight(ServerState *state,
         flight->seats[i].passenger_id[0] = '\0';
     }
     init_flight_seat_mutexes(flight);
-    return storage_flush_flights(state);
+    (void)fulfill_waitlist_for_flight(state, slot);
+    if (storage_flush_flights(state) != 0) {
+        return -1;
+    }
+    return storage_flush_flight_bookings(state, slot);
 }
 
 int change_flight_timings(ServerState *state,

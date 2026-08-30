@@ -28,6 +28,7 @@ typedef struct {
     const char *host;
     int port;
     const char *command;
+    char command_buf[768];
     char response[RESP_SIZE];
     int status; /* 0=unset, 1=ok, 2=err, 3=other */
     int thread_rc;
@@ -41,7 +42,7 @@ typedef struct {
     const char *commands[MAX_CONCURRENT];
     int command_count;
     int expected_ok;
-    int expected_reject; /* ERR booking failed and/or REQUESTED under contention */
+    int expected_reject; /* ERR, REQUESTED, or WAITLISTED under contention */
     const char *verify_command;
     const char *verify_substr;
     const char *verify_command_b;
@@ -53,6 +54,59 @@ typedef struct {
 
 static int tests_run = 0;
 static int tests_passed = 0;
+
+#define TOKEN_SIZE 192
+#define MAX_CACHED_TOKENS 80
+
+static char g_admin_token[TOKEN_SIZE];
+static struct {
+    char id[64];
+    char token[TOKEN_SIZE];
+} g_user_tokens[MAX_CACHED_TOKENS];
+static int g_user_token_count;
+
+static void reset_auth_cache(void) {
+    g_admin_token[0] = '\0';
+    g_user_token_count = 0;
+    memset(g_user_tokens, 0, sizeof(g_user_tokens));
+}
+
+static int parse_ok_token(const char *response, char *out, size_t out_size) {
+    if (response == NULL || strncmp(response, "OK ", 3) != 0) {
+        return -1;
+    }
+    char token[TOKEN_SIZE];
+    if (sscanf(response + 3, "%191s", token) != 1 || token[0] == '\0') {
+        return -1;
+    }
+    snprintf(out, out_size, "%s", token);
+    return 0;
+}
+
+static int cache_user_token(const char *id, const char *token) {
+    for (int i = 0; i < g_user_token_count; i++) {
+        if (strcmp(g_user_tokens[i].id, id) == 0) {
+            snprintf(g_user_tokens[i].token, sizeof(g_user_tokens[i].token), "%s", token);
+            return 0;
+        }
+    }
+    if (g_user_token_count >= MAX_CACHED_TOKENS) {
+        return -1;
+    }
+    snprintf(g_user_tokens[g_user_token_count].id, sizeof(g_user_tokens[g_user_token_count].id), "%s", id);
+    snprintf(g_user_tokens[g_user_token_count].token, sizeof(g_user_tokens[g_user_token_count].token), "%s", token);
+    g_user_token_count++;
+    return 0;
+}
+
+static const char *lookup_user_token(const char *id) {
+    for (int i = 0; i < g_user_token_count; i++) {
+        if (strcmp(g_user_tokens[i].id, id) == 0) {
+            return g_user_tokens[i].token;
+        }
+    }
+    return NULL;
+}
 
 static int connect_server(const char *host, int port) {
     struct addrinfo hints;
@@ -125,6 +179,72 @@ static int send_command(const char *host, int port, const char *command, char *r
     return off > 0 ? 0 : -1;
 }
 
+static int ensure_admin_token(const char *host, int port) {
+    if (g_admin_token[0] != '\0') {
+        return 0;
+    }
+    char response[RESP_SIZE];
+    if (send_command(host, port, "ADMIN_LOGIN admin admin123", response, sizeof(response)) != 0) {
+        return -1;
+    }
+    return parse_ok_token(response, g_admin_token, sizeof(g_admin_token));
+}
+
+static int rewrite_auth_command(const char *in, char *out, size_t out_size) {
+    char cmd[64];
+    if (in == NULL || sscanf(in, "%63s", cmd) != 1) {
+        return -1;
+    }
+
+    if (strcmp(cmd, "ADMIN_CREATE_FLIGHT") == 0) {
+        const char *rest = strstr(in, "admin123");
+        if (rest == NULL || g_admin_token[0] == '\0') {
+            return -1;
+        }
+        rest += strlen("admin123");
+        while (*rest == ' ') {
+            rest++;
+        }
+        snprintf(out, out_size, "ADMIN_CREATE_FLIGHT %s %s", g_admin_token, rest);
+        return 0;
+    }
+
+    if (strcmp(cmd, "BOOK") == 0) {
+        char user[64];
+        if (sscanf(in, "BOOK %63s", user) != 1) {
+            return -1;
+        }
+        const char *token = lookup_user_token(user);
+        if (token == NULL) {
+            return -1;
+        }
+        const char *rest = in + 4;
+        while (*rest == ' ') {
+            rest++;
+        }
+        while (*rest != '\0' && *rest != ' ') {
+            rest++;
+        }
+        if (*rest == ' ') {
+            rest++;
+        }
+        snprintf(out, out_size, "BOOK %s %s", token, rest);
+        return 0;
+    }
+
+    if (strcmp(cmd, "DETAIL") == 0) {
+        char flight[24];
+        if (sscanf(in, "DETAIL %23s", flight) != 1 || g_admin_token[0] == '\0') {
+            return -1;
+        }
+        snprintf(out, out_size, "DETAIL %s %s", g_admin_token, flight);
+        return 0;
+    }
+
+    snprintf(out, out_size, "%s", in);
+    return 0;
+}
+
 static int classify_response(const char *response) {
     if (response == NULL) {
         return 3;
@@ -138,11 +258,14 @@ static int classify_response(const char *response) {
     if (strncmp(response, "REQUESTED", 9) == 0) {
         return 4;
     }
+    if (strncmp(response, "WAITLISTED", 10) == 0) {
+        return 5;
+    }
     return 3;
 }
 
 static int is_rejection_status(int status) {
-    return status == 2 || status == 4;
+    return status == 2 || status == 4 || status == 5;
 }
 
 static void *concurrent_worker(void *arg) {
@@ -166,19 +289,48 @@ static void *concurrent_worker(void *arg) {
 
 static int run_setup(const char *host, int port, const char *const *setup) {
     char response[RESP_SIZE];
+    if (ensure_admin_token(host, port) != 0) {
+        fprintf(stderr, "  admin login for setup failed\n");
+        return -1;
+    }
     for (int i = 0; setup[i] != NULL; i++) {
-        if (send_command(host, port, setup[i], response, sizeof(response)) != 0) {
+        char rewritten[768];
+        if (rewrite_auth_command(setup[i], rewritten, sizeof(rewritten)) != 0) {
+            fprintf(stderr, "  setup rewrite failed: %s\n", setup[i]);
+            return -1;
+        }
+        if (send_command(host, port, rewritten, response, sizeof(response)) != 0) {
             fprintf(stderr, "  setup send failed: %s\n", setup[i]);
             return -1;
         }
-        if (strncmp(response, "OK", 2) != 0 && strncmp(response, "ERROR:", 6) != 0) {
-            /* SIGNUP duplicate on reruns within same server life is fine */
-            if (strstr(setup[i], "SIGNUP") != NULL && strncmp(response, "ERROR:", 6) == 0) {
+        if (strncmp(setup[i], "SIGNUP ", 7) == 0) {
+            char user[64], password[64], token[TOKEN_SIZE];
+            if (sscanf(setup[i], "SIGNUP %63s %63s", user, password) != 2) {
+                fprintf(stderr, "  invalid SIGNUP setup: %s\n", setup[i]);
+                return -1;
+            }
+            if (strncmp(response, "OK ", 3) == 0) {
+                if (parse_ok_token(response, token, sizeof(token)) != 0 || cache_user_token(user, token) != 0) {
+                    fprintf(stderr, "  failed to cache token for %s\n", user);
+                    return -1;
+                }
                 continue;
             }
+            if (strncmp(response, "ERROR:", 6) == 0) {
+                char login_cmd[160];
+                snprintf(login_cmd, sizeof(login_cmd), "LOGIN %s %s", user, password);
+                if (send_command(host, port, login_cmd, response, sizeof(response)) != 0 ||
+                    parse_ok_token(response, token, sizeof(token)) != 0 ||
+                    cache_user_token(user, token) != 0) {
+                    fprintf(stderr, "  login after existing signup failed for %s: %s", user, response);
+                    return -1;
+                }
+                continue;
+            }
+            fprintf(stderr, "  setup unexpected SIGNUP response for `%s`:\n    got: %s", setup[i], response);
+            return -1;
         }
-        if (strncmp(response, "OK", 2) != 0 &&
-            !(strstr(setup[i], "SIGNUP") != NULL && strncmp(response, "ERROR:", 6) == 0)) {
+        if (strncmp(response, "OK", 2) != 0) {
             fprintf(stderr, "  setup unexpected response for `%s`:\n    got: %s", setup[i], response);
             return -1;
         }
@@ -224,6 +376,7 @@ static int run_test_case(const char *host, int port, const TestCase *tc) {
     printf("\n=== TEST: %s ===\n", tc->name);
     printf("%s\n", tc->description);
 
+    reset_auth_cache();
     if (run_setup(host, port, tc->setup) != 0) {
         printf("RESULT: FAIL (setup)\n");
         return 0;
@@ -247,7 +400,12 @@ static int run_test_case(const char *host, int port, const TestCase *tc) {
     for (int i = 0; i < tc->command_count; i++) {
         jobs[i].host = host;
         jobs[i].port = port;
-        jobs[i].command = tc->commands[i];
+        if (rewrite_auth_command(tc->commands[i], jobs[i].command_buf, sizeof(jobs[i].command_buf)) != 0) {
+            printf("RESULT: FAIL (rewrite %s)\n", tc->commands[i]);
+            pthread_barrier_destroy(&barrier);
+            return 0;
+        }
+        jobs[i].command = jobs[i].command_buf;
         jobs[i].barrier = &barrier;
         if (pthread_create(&threads[i], NULL, concurrent_worker, &jobs[i]) != 0) {
             printf("RESULT: FAIL (pthread_create)\n");
@@ -299,7 +457,7 @@ static int run_test_case(const char *host, int port, const TestCase *tc) {
         pass = 0;
     }
     if (reject_count != tc->expected_reject) {
-        printf("  expected reject count %d (ERR or REQUESTED), got %d\n", tc->expected_reject, reject_count);
+        printf("  expected reject count %d (ERR, REQUESTED, or WAITLISTED), got %d\n", tc->expected_reject, reject_count);
         pass = 0;
     }
     if (other_count != 0) {
@@ -318,7 +476,11 @@ static int run_test_case(const char *host, int port, const TestCase *tc) {
 
     if (tc->verify_command != NULL && tc->verify_substr != NULL) {
         char verify_resp[RESP_SIZE];
-        if (send_command(host, port, tc->verify_command, verify_resp, sizeof(verify_resp)) != 0) {
+        char verify_cmd[768];
+        if (rewrite_auth_command(tc->verify_command, verify_cmd, sizeof(verify_cmd)) != 0) {
+            printf("  verify rewrite failed: %s\n", tc->verify_command);
+            pass = 0;
+        } else if (send_command(host, port, verify_cmd, verify_resp, sizeof(verify_resp)) != 0) {
             printf("  verify command failed: %s\n", tc->verify_command);
             pass = 0;
         } else {
@@ -332,7 +494,11 @@ static int run_test_case(const char *host, int port, const TestCase *tc) {
 
     if (pass && tc->verify_command_b != NULL && tc->verify_substr_b != NULL) {
         char verify_resp[RESP_SIZE];
-        if (send_command(host, port, tc->verify_command_b, verify_resp, sizeof(verify_resp)) != 0) {
+        char verify_cmd[768];
+        if (rewrite_auth_command(tc->verify_command_b, verify_cmd, sizeof(verify_cmd)) != 0) {
+            printf("  verify rewrite failed: %s\n", tc->verify_command_b);
+            pass = 0;
+        } else if (send_command(host, port, verify_cmd, verify_resp, sizeof(verify_resp)) != 0) {
             printf("  verify command failed: %s\n", tc->verify_command_b);
             pass = 0;
         } else {
@@ -480,7 +646,7 @@ int main(int argc, char **argv) {
                 "5 clients each request 2 seats on CF104 (capacity 10) concurrently.\n"
                 "Expect exactly 5 OK (10 seats total) and no ERR.",
             .setup = {
-                "ADMIN_CREATE_FLIGHT admin admin123 CF104 BLR DEL 17 8 2026 10 1500.00",
+                "ADMIN_CREATE_FLIGHT admin admin123 CF104 COK TRV 17 8 2026 10 1500.00",
                 "SIGNUP user01 pass01",
                 "SIGNUP user02 pass02",
                 "SIGNUP user03 pass03",
@@ -489,11 +655,11 @@ int main(int argc, char **argv) {
                 NULL,
             },
             .commands = {
-                "BOOK user01 BLR DEL 17 8 2026 2",
-                "BOOK user02 BLR DEL 17 8 2026 2",
-                "BOOK user03 BLR DEL 17 8 2026 2",
-                "BOOK user04 BLR DEL 17 8 2026 2",
-                "BOOK user05 BLR DEL 17 8 2026 2",
+                "BOOK user01 COK TRV 17 8 2026 2",
+                "BOOK user02 COK TRV 17 8 2026 2",
+                "BOOK user03 COK TRV 17 8 2026 2",
+                "BOOK user04 COK TRV 17 8 2026 2",
+                "BOOK user05 COK TRV 17 8 2026 2",
             },
             .command_count = 5,
             .expected_ok = 5,
@@ -509,7 +675,7 @@ int main(int argc, char **argv) {
                 "10 clients each request 2 seats on CF105 (capacity 10) concurrently.\n"
                 "Only 5 can succeed; the other 5 must fail.",
             .setup = {
-                "ADMIN_CREATE_FLIGHT admin admin123 CF105 BLR DEL 18 8 2026 10 1500.00",
+                "ADMIN_CREATE_FLIGHT admin admin123 CF105 IXC GAU 18 8 2026 10 1500.00",
                 "SIGNUP user06 pass06",
                 "SIGNUP user07 pass07",
                 "SIGNUP user08 pass08",
@@ -523,16 +689,16 @@ int main(int argc, char **argv) {
                 NULL,
             },
             .commands = {
-                "BOOK user06 BLR DEL 18 8 2026 2",
-                "BOOK user07 BLR DEL 18 8 2026 2",
-                "BOOK user08 BLR DEL 18 8 2026 2",
-                "BOOK user09 BLR DEL 18 8 2026 2",
-                "BOOK user10 BLR DEL 18 8 2026 2",
-                "BOOK user11 BLR DEL 18 8 2026 2",
-                "BOOK user12 BLR DEL 18 8 2026 2",
-                "BOOK user13 BLR DEL 18 8 2026 2",
-                "BOOK user14 BLR DEL 18 8 2026 2",
-                "BOOK user15 BLR DEL 18 8 2026 2",
+                "BOOK user06 IXC GAU 18 8 2026 2",
+                "BOOK user07 IXC GAU 18 8 2026 2",
+                "BOOK user08 IXC GAU 18 8 2026 2",
+                "BOOK user09 IXC GAU 18 8 2026 2",
+                "BOOK user10 IXC GAU 18 8 2026 2",
+                "BOOK user11 IXC GAU 18 8 2026 2",
+                "BOOK user12 IXC GAU 18 8 2026 2",
+                "BOOK user13 IXC GAU 18 8 2026 2",
+                "BOOK user14 IXC GAU 18 8 2026 2",
+                "BOOK user15 IXC GAU 18 8 2026 2",
             },
             .command_count = 10,
             .expected_ok = 5,
@@ -548,7 +714,7 @@ int main(int argc, char **argv) {
                 "8 clients race for 1 remaining-style scenario on CF106 (capacity 1).\n"
                 "Expect 1 OK and 7 ERR booking failed.",
             .setup = {
-                "ADMIN_CREATE_FLIGHT admin admin123 CF106 BLR DEL 19 8 2026 1 500.00",
+                "ADMIN_CREATE_FLIGHT admin admin123 CF106 JAI UDR 19 8 2026 1 500.00",
                 "SIGNUP user01 pass01",
                 "SIGNUP user02 pass02",
                 "SIGNUP user03 pass03",
@@ -560,14 +726,14 @@ int main(int argc, char **argv) {
                 NULL,
             },
             .commands = {
-                "BOOK user01 BLR DEL 19 8 2026 1",
-                "BOOK user02 BLR DEL 19 8 2026 1",
-                "BOOK user03 BLR DEL 19 8 2026 1",
-                "BOOK user04 BLR DEL 19 8 2026 1",
-                "BOOK user05 BLR DEL 19 8 2026 1",
-                "BOOK user06 BLR DEL 19 8 2026 1",
-                "BOOK user07 BLR DEL 19 8 2026 1",
-                "BOOK user08 BLR DEL 19 8 2026 1",
+                "BOOK user01 JAI UDR 19 8 2026 1",
+                "BOOK user02 JAI UDR 19 8 2026 1",
+                "BOOK user03 JAI UDR 19 8 2026 1",
+                "BOOK user04 JAI UDR 19 8 2026 1",
+                "BOOK user05 JAI UDR 19 8 2026 1",
+                "BOOK user06 JAI UDR 19 8 2026 1",
+                "BOOK user07 JAI UDR 19 8 2026 1",
+                "BOOK user08 JAI UDR 19 8 2026 1",
             },
             .command_count = 8,
             .expected_ok = 1,
@@ -583,14 +749,14 @@ int main(int argc, char **argv) {
                 "Two flights booked concurrently should each assign BK0001 independently.\n"
                 "One client books CF107, another books CF108 at the same time.",
             .setup = {
-                "ADMIN_CREATE_FLIGHT admin admin123 CF107 BLR DEL 20 8 2026 3 900.00",
+                "ADMIN_CREATE_FLIGHT admin admin123 CF107 PAT RPR 20 8 2026 3 900.00",
                 "ADMIN_CREATE_FLIGHT admin admin123 CF108 BLR MUM 20 8 2026 3 900.00",
                 "SIGNUP user01 pass01",
                 "SIGNUP user02 pass02",
                 NULL,
             },
             .commands = {
-                "BOOK user01 BLR DEL 20 8 2026 1",
+                "BOOK user01 PAT RPR 20 8 2026 1",
                 "BOOK user02 BLR MUM 20 8 2026 1",
             },
             .command_count = 2,
@@ -610,7 +776,7 @@ int main(int argc, char **argv) {
                 "50 clients race for CF109 with 25 seats (max per flight).\n"
                 "Expect exactly 25 OK and 25 ERR — strong overbooking guard.",
             .setup = {
-                "ADMIN_CREATE_FLIGHT admin admin123 CF109 BLR DEL 21 8 2026 25 750.00",
+                "ADMIN_CREATE_FLIGHT admin admin123 CF109 AMD PNQ 21 8 2026 25 750.00",
                 "SIGNUP user01 pass01",
                 "SIGNUP user02 pass02",
                 "SIGNUP user03 pass03",
@@ -634,56 +800,56 @@ int main(int argc, char **argv) {
                 NULL,
             },
             .commands = {
-                "BOOK user01 BLR DEL 21 8 2026 1",
-                "BOOK user02 BLR DEL 21 8 2026 1",
-                "BOOK user03 BLR DEL 21 8 2026 1",
-                "BOOK user04 BLR DEL 21 8 2026 1",
-                "BOOK user05 BLR DEL 21 8 2026 1",
-                "BOOK user06 BLR DEL 21 8 2026 1",
-                "BOOK user07 BLR DEL 21 8 2026 1",
-                "BOOK user08 BLR DEL 21 8 2026 1",
-                "BOOK user09 BLR DEL 21 8 2026 1",
-                "BOOK user10 BLR DEL 21 8 2026 1",
-                "BOOK user11 BLR DEL 21 8 2026 1",
-                "BOOK user12 BLR DEL 21 8 2026 1",
-                "BOOK user13 BLR DEL 21 8 2026 1",
-                "BOOK user14 BLR DEL 21 8 2026 1",
-                "BOOK user15 BLR DEL 21 8 2026 1",
-                "BOOK user16 BLR DEL 21 8 2026 1",
-                "BOOK user17 BLR DEL 21 8 2026 1",
-                "BOOK user18 BLR DEL 21 8 2026 1",
-                "BOOK user19 BLR DEL 21 8 2026 1",
-                "BOOK user20 BLR DEL 21 8 2026 1",
-                "BOOK user01 BLR DEL 21 8 2026 1",
-                "BOOK user02 BLR DEL 21 8 2026 1",
-                "BOOK user03 BLR DEL 21 8 2026 1",
-                "BOOK user04 BLR DEL 21 8 2026 1",
-                "BOOK user05 BLR DEL 21 8 2026 1",
-                "BOOK user06 BLR DEL 21 8 2026 1",
-                "BOOK user07 BLR DEL 21 8 2026 1",
-                "BOOK user08 BLR DEL 21 8 2026 1",
-                "BOOK user09 BLR DEL 21 8 2026 1",
-                "BOOK user10 BLR DEL 21 8 2026 1",
-                "BOOK user11 BLR DEL 21 8 2026 1",
-                "BOOK user12 BLR DEL 21 8 2026 1",
-                "BOOK user13 BLR DEL 21 8 2026 1",
-                "BOOK user14 BLR DEL 21 8 2026 1",
-                "BOOK user15 BLR DEL 21 8 2026 1",
-                "BOOK user16 BLR DEL 21 8 2026 1",
-                "BOOK user17 BLR DEL 21 8 2026 1",
-                "BOOK user18 BLR DEL 21 8 2026 1",
-                "BOOK user19 BLR DEL 21 8 2026 1",
-                "BOOK user20 BLR DEL 21 8 2026 1",
-                "BOOK user01 BLR DEL 21 8 2026 1",
-                "BOOK user02 BLR DEL 21 8 2026 1",
-                "BOOK user03 BLR DEL 21 8 2026 1",
-                "BOOK user04 BLR DEL 21 8 2026 1",
-                "BOOK user05 BLR DEL 21 8 2026 1",
-                "BOOK user06 BLR DEL 21 8 2026 1",
-                "BOOK user07 BLR DEL 21 8 2026 1",
-                "BOOK user08 BLR DEL 21 8 2026 1",
-                "BOOK user09 BLR DEL 21 8 2026 1",
-                "BOOK user10 BLR DEL 21 8 2026 1",
+                "BOOK user01 AMD PNQ 21 8 2026 1",
+                "BOOK user02 AMD PNQ 21 8 2026 1",
+                "BOOK user03 AMD PNQ 21 8 2026 1",
+                "BOOK user04 AMD PNQ 21 8 2026 1",
+                "BOOK user05 AMD PNQ 21 8 2026 1",
+                "BOOK user06 AMD PNQ 21 8 2026 1",
+                "BOOK user07 AMD PNQ 21 8 2026 1",
+                "BOOK user08 AMD PNQ 21 8 2026 1",
+                "BOOK user09 AMD PNQ 21 8 2026 1",
+                "BOOK user10 AMD PNQ 21 8 2026 1",
+                "BOOK user11 AMD PNQ 21 8 2026 1",
+                "BOOK user12 AMD PNQ 21 8 2026 1",
+                "BOOK user13 AMD PNQ 21 8 2026 1",
+                "BOOK user14 AMD PNQ 21 8 2026 1",
+                "BOOK user15 AMD PNQ 21 8 2026 1",
+                "BOOK user16 AMD PNQ 21 8 2026 1",
+                "BOOK user17 AMD PNQ 21 8 2026 1",
+                "BOOK user18 AMD PNQ 21 8 2026 1",
+                "BOOK user19 AMD PNQ 21 8 2026 1",
+                "BOOK user20 AMD PNQ 21 8 2026 1",
+                "BOOK user01 AMD PNQ 21 8 2026 1",
+                "BOOK user02 AMD PNQ 21 8 2026 1",
+                "BOOK user03 AMD PNQ 21 8 2026 1",
+                "BOOK user04 AMD PNQ 21 8 2026 1",
+                "BOOK user05 AMD PNQ 21 8 2026 1",
+                "BOOK user06 AMD PNQ 21 8 2026 1",
+                "BOOK user07 AMD PNQ 21 8 2026 1",
+                "BOOK user08 AMD PNQ 21 8 2026 1",
+                "BOOK user09 AMD PNQ 21 8 2026 1",
+                "BOOK user10 AMD PNQ 21 8 2026 1",
+                "BOOK user11 AMD PNQ 21 8 2026 1",
+                "BOOK user12 AMD PNQ 21 8 2026 1",
+                "BOOK user13 AMD PNQ 21 8 2026 1",
+                "BOOK user14 AMD PNQ 21 8 2026 1",
+                "BOOK user15 AMD PNQ 21 8 2026 1",
+                "BOOK user16 AMD PNQ 21 8 2026 1",
+                "BOOK user17 AMD PNQ 21 8 2026 1",
+                "BOOK user18 AMD PNQ 21 8 2026 1",
+                "BOOK user19 AMD PNQ 21 8 2026 1",
+                "BOOK user20 AMD PNQ 21 8 2026 1",
+                "BOOK user01 AMD PNQ 21 8 2026 1",
+                "BOOK user02 AMD PNQ 21 8 2026 1",
+                "BOOK user03 AMD PNQ 21 8 2026 1",
+                "BOOK user04 AMD PNQ 21 8 2026 1",
+                "BOOK user05 AMD PNQ 21 8 2026 1",
+                "BOOK user06 AMD PNQ 21 8 2026 1",
+                "BOOK user07 AMD PNQ 21 8 2026 1",
+                "BOOK user08 AMD PNQ 21 8 2026 1",
+                "BOOK user09 AMD PNQ 21 8 2026 1",
+                "BOOK user10 AMD PNQ 21 8 2026 1",
             },
             .command_count = 50,
             .expected_ok = 25,

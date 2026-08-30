@@ -1,7 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "server_state.h"
 #include "admin_ipc.h"
+#include "auth_service.h"
 #include "storage_service.h"
+#include "token.h"
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -13,11 +15,21 @@ int server_init(ServerState *state) {
     pthread_mutex_init(&state->state_lock, NULL);
     pthread_mutex_init(&state->flights_lock, NULL);
     pthread_mutex_init(&state->requests_lock, NULL);
+    pthread_mutex_init(&state->waitlist_lock, NULL);
+
+    if (load_or_create_auth_secret(state->auth_secret, sizeof(state->auth_secret)) != 0) {
+        pthread_mutex_destroy(&state->state_lock);
+        pthread_mutex_destroy(&state->flights_lock);
+        pthread_mutex_destroy(&state->requests_lock);
+        pthread_mutex_destroy(&state->waitlist_lock);
+        return -1;
+    }
 
     if (storage_init(state) != 0) {
         pthread_mutex_destroy(&state->state_lock);
         pthread_mutex_destroy(&state->flights_lock);
         pthread_mutex_destroy(&state->requests_lock);
+        pthread_mutex_destroy(&state->waitlist_lock);
         return -1;
     }
 
@@ -33,6 +45,7 @@ int server_init(ServerState *state) {
             pthread_mutex_destroy(&state->state_lock);
             pthread_mutex_destroy(&state->flights_lock);
             pthread_mutex_destroy(&state->requests_lock);
+            pthread_mutex_destroy(&state->waitlist_lock);
             return -1;
         }
     }
@@ -42,6 +55,7 @@ int server_init(ServerState *state) {
         pthread_mutex_destroy(&state->state_lock);
         pthread_mutex_destroy(&state->flights_lock);
         pthread_mutex_destroy(&state->requests_lock);
+        pthread_mutex_destroy(&state->waitlist_lock);
         return -1;
     }
     ftruncate(state->shm_fd, ADMIN_SHM_SIZE);
@@ -51,6 +65,7 @@ int server_init(ServerState *state) {
         pthread_mutex_destroy(&state->state_lock);
         pthread_mutex_destroy(&state->flights_lock);
         pthread_mutex_destroy(&state->requests_lock);
+        pthread_mutex_destroy(&state->waitlist_lock);
         return -1;
     }
 
@@ -84,4 +99,5 @@ void server_shutdown(ServerState *state) {
     pthread_mutex_destroy(&state->state_lock);
     pthread_mutex_destroy(&state->flights_lock);
     pthread_mutex_destroy(&state->requests_lock);
+    pthread_mutex_destroy(&state->waitlist_lock);
 }

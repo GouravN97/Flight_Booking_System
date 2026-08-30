@@ -32,7 +32,6 @@ int main(int argc, char **argv) {
 
     bool admin_authenticated = false;
     char current_admin[64] = {0};
-    char current_admin_password[64] = {0};
 
     while (1) {
         int choice = 0;
@@ -67,7 +66,6 @@ int main(int argc, char **argv) {
                 if (admin_login(admin_id, password) == 0) {
                     admin_authenticated = true;
                     snprintf(current_admin, sizeof(current_admin), "%s", admin_id);
-                    snprintf(current_admin_password, sizeof(current_admin_password), "%s", password);
                     printf("Admin login OK\n");
                 } else {
                     printf("Admin login failed\n");
@@ -84,7 +82,7 @@ int main(int argc, char **argv) {
             char admin_id[64], password[64];
             read_token("New admin ID: ", admin_id, sizeof(admin_id));
             read_token("New admin password: ", password, sizeof(password));
-            printf(admin_create_user(current_admin, current_admin_password, admin_id, password) == 0
+            printf(admin_create_user(admin_id, password) == 0
                        ? "Admin created\n"
                        : "Admin create failed\n");
         } else if (choice == 2) {
@@ -120,9 +118,7 @@ int main(int argc, char **argv) {
                                        month,
                                        year,
                                        seats,
-                                       price,
-                                       current_admin,
-                                       current_admin_password) == 0
+                                       price) == 0
                        ? "Flight created\n"
                        : "Create flight failed\n");
         } else if (choice == 3) {
@@ -138,7 +134,7 @@ int main(int argc, char **argv) {
                 printf("Invalid date\n");
                 continue;
             }
-            printf(admin_change_flight_timing(flight_number, day, month, year, current_admin, current_admin_password) == 0
+            printf(admin_change_flight_timing(flight_number, day, month, year) == 0
                        ? "Timing updated\n"
                        : "Timing update failed\n");
         } else if (choice == 4) {
@@ -154,15 +150,15 @@ int main(int argc, char **argv) {
                 printf("Invalid price\n");
                 continue;
             }
-            printf(admin_update_flight_price(flight_number, price, current_admin, current_admin_password) == 0
+            printf(admin_update_flight_price(flight_number, price) == 0
                        ? "Price updated\n"
                        : "Price update failed\n");
         } else if (choice == 5) {
-            if (admin_list_all_flights(current_admin, current_admin_password) != 0) {
+            if (admin_list_all_flights() != 0) {
                 printf("Failed to list flights\n");
             }
         } else if (choice == 6) {
-            if (admin_list_all_admins(current_admin, current_admin_password) != 0) {
+            if (admin_list_all_admins() != 0) {
                 printf("Failed to list admins\n");
             }
         } else if (choice == 7) {
@@ -180,7 +176,7 @@ int main(int argc, char **argv) {
         } else if (choice == 9) {
             admin_authenticated = false;
             current_admin[0] = '\0';
-            current_admin_password[0] = '\0';
+            client_logout();
             printf("Logged out\n");
         } else if (choice == 10) {
             break;

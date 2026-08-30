@@ -1,4 +1,5 @@
 #include "auth_service.h"
+#include "password.h"
 #include "storage_service.h"
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,9 @@ int find_user_index(ServerState *state, const char *id) {
 }
 
 int signup_user(ServerState *state, const char *id, const char *password) {
+    if (id == NULL || password == NULL || id[0] == '\0' || password[0] == '\0') {
+        return -1;
+    }
     if (find_user_index(state, id) >= 0) {
         return -1;
     }
@@ -31,7 +35,10 @@ int signup_user(ServerState *state, const char *id, const char *password) {
 
     state->users[slot].in_use = 1;
     snprintf(state->users[slot].id, sizeof(state->users[slot].id), "%s", id);
-    snprintf(state->users[slot].password, sizeof(state->users[slot].password), "%s", password);
+    if (hash_password(password, state->users[slot].password, sizeof(state->users[slot].password)) != 0) {
+        memset(&state->users[slot], 0, sizeof(state->users[slot]));
+        return -1;
+    }
     return storage_flush_users(state);
 }
 
@@ -41,9 +48,5 @@ int login_user(ServerState *state, const char *id, const char *password) {
         return -1;
     }
 
-    if (strncmp(state->users[idx].password, password, sizeof(state->users[idx].password)) != 0) {
-        return -1;
-    }
-
-    return 0;
+    return verify_password(password, state->users[idx].password);
 }

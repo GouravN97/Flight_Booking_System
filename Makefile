@@ -17,12 +17,13 @@ MY_DBMS_SRCS = $(MY_DBMS_DIR)/src/api/db.c \
 SERVER_SRCS = apps/server_app.c \
                server/server_main.c server/server_state.c server/server_protocol.c \
                server/auth_service.c server/flight_service.c server/booking_service.c \
+               server/waitlist_service.c server/password.c server/token.c \
                server/admin_ipc.c storage/storage_service.c storage/db_handler.c \
                $(MY_DBMS_SRCS)
 CLIENT_SRCS = apps/client_app.c client/client.c
 ADMIN_SRCS = apps/admin_app.c client/client.c
 
-.PHONY: all clean server client admin reset-bookings-db test-concurrency concurrent_booking_test
+.PHONY: all clean server client admin reset-bookings-db test-concurrency concurrent_booking_test api
 
 all: server_app client_app admin_app
 
@@ -46,7 +47,10 @@ client: client_app
 admin: admin_app
 
 clean:
-	rm -f server_app client_app admin_app concurrent_booking_test *.db
+	rm -f server_app client_app admin_app concurrent_booking_test *.db auth.secret
 
 reset-bookings-db:
 	rm -f bookings.db
+
+api:
+	python3 web/api/gateway.py

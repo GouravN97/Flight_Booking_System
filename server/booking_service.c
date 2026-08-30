@@ -3,6 +3,7 @@
 #include "flight_service.h"
 #include "admin_ipc.h"
 #include "storage_service.h"
+#include "waitlist_service.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -123,58 +124,44 @@ static int request_matching_flight_from_admins(ServerState *state,
     return publish_admin_request(state, admin_message);
 }
 
-int book_seats_for_user(ServerState *state,
-                        const char *user_id,
-                        const char *source,
-                        const char *destination,
-                        int day,
-                        int month,
-                        int year,
-                        int requested,
-                        char *out_booking_id,
-                        size_t out_booking_id_size) {
-    if (requested <= 0 || requested > MAX_SEATS_PER_FLIGHT) {
+static int waitlist_and_notify_admins(ServerState *state,
+                                      const char *user_id,
+                                      const char *source,
+                                      const char *destination,
+                                      int day,
+                                      int month,
+                                      int year,
+                                      int requested) {
+    int queued = enqueue_waitlist(state, user_id, source, destination, day, month, year, requested);
+    (void)request_matching_flight_from_admins(state,
+                                              user_id,
+                                              source,
+                                              destination,
+                                              day,
+                                              month,
+                                              year,
+                                              requested);
+    return queued == 0 ? BOOKING_WAITLISTED : BOOKING_ADMIN_REQUESTED;
+}
+
+int book_seats_on_flight(ServerState *state,
+                         int flight_idx,
+                         const char *user_id,
+                         int requested,
+                         char *out_booking_id,
+                         size_t out_booking_id_size,
+                         int flights_lock_held,
+                         int persist) {
+    if (state == NULL || flight_idx < 0 || flight_idx >= MAX_FLIGHTS ||
+        user_id == NULL || requested <= 0 || requested > MAX_SEATS_PER_FLIGHT ||
+        out_booking_id == NULL || out_booking_id_size == 0) {
         return -1;
     }
 
-    int user_idx = find_user_index(state, user_id);
-    if (user_idx < 0) {
-        return -2;
+    Flight *f = &state->flights[flight_idx];
+    if (!f->in_use) {
+        return -1;
     }
-
-    if (out_booking_id == NULL || out_booking_id_size == 0) {
-        return -3;
-    }
-
-    pthread_mutex_lock(&state->flights_lock);
-    int fidx = find_matching_flight_with_capacity(state, source, destination, day, month, year, requested);
-    pthread_mutex_unlock(&state->flights_lock);
-
-    if (fidx < 0) {
-        int auto_created = track_flight_request(state, source, destination, day, month, year, requested);
-
-        if (auto_created == 1) {
-            pthread_mutex_lock(&state->flights_lock);
-            fidx = find_matching_flight_with_capacity(state, source, destination, day, month, year, requested);
-            pthread_mutex_unlock(&state->flights_lock);
-        }
-
-        if (fidx < 0) {
-            if (request_matching_flight_from_admins(state,
-                                                   user_id,
-                                                   source,
-                                                   destination,
-                                                   day,
-                                                   month,
-                                                   year,
-                                                   requested) != 0) {
-                return -4;
-            }
-            return BOOKING_ADMIN_REQUESTED;
-        }
-    }
-
-    Flight *f = &state->flights[fidx];
 
     int acquired = 0;
     for (int i = 0; i < requested; i++) {
@@ -226,7 +213,9 @@ int book_seats_for_user(ServerState *state,
     int slot = -1;
     char booking_id[64];
     booking_id[0] = '\0';
-    pthread_mutex_lock(&state->flights_lock);
+    if (!flights_lock_held) {
+        pthread_mutex_lock(&state->flights_lock);
+    }
     generate_booking_id(f, booking_id, sizeof(booking_id));
     if (booking_id[0] != '\0') {
         for (int i = 0; i < MAX_BOOKINGS_PER_FLIGHT; i++) {
@@ -250,7 +239,9 @@ int book_seats_for_user(ServerState *state,
             f->bookings[slot].seat_numbers[i] = allocated[i];
         }
     }
-    pthread_mutex_unlock(&state->flights_lock);
+    if (!flights_lock_held) {
+        pthread_mutex_unlock(&state->flights_lock);
+    }
 
     if (slot < 0) {
         for (int i = 0; i < allocated_count; i++) {
@@ -268,11 +259,61 @@ int book_seats_for_user(ServerState *state,
         return booking_id[0] == '\0' ? -3 : -7;
     }
 
-    if (storage_flush_flights(state) != 0 || storage_flush_flight_bookings(state, fidx) != 0) {
-        return -8;
+    if (persist) {
+        if (storage_flush_flights(state) != 0 || storage_flush_flight_bookings(state, flight_idx) != 0) {
+            return -8;
+        }
     }
     snprintf(out_booking_id, out_booking_id_size, "%s", booking_id);
     return 0;
+}
+
+int book_seats_for_user(ServerState *state,
+                        const char *user_id,
+                        const char *source,
+                        const char *destination,
+                        int day,
+                        int month,
+                        int year,
+                        int requested,
+                        char *out_booking_id,
+                        size_t out_booking_id_size) {
+    if (requested <= 0 || requested > MAX_SEATS_PER_FLIGHT) {
+        return -1;
+    }
+
+    int user_idx = find_user_index(state, user_id);
+    if (user_idx < 0) {
+        return -2;
+    }
+
+    if (out_booking_id == NULL || out_booking_id_size == 0) {
+        return -3;
+    }
+
+    pthread_mutex_lock(&state->flights_lock);
+    int fidx = find_matching_flight_with_capacity(state, source, destination, day, month, year, requested);
+    pthread_mutex_unlock(&state->flights_lock);
+
+    if (fidx < 0) {
+        int auto_created = track_flight_request(state, source, destination, day, month, year, requested);
+
+        if (auto_created == 1) {
+            pthread_mutex_lock(&state->flights_lock);
+            fidx = find_matching_flight_with_capacity(state, source, destination, day, month, year, requested);
+            pthread_mutex_unlock(&state->flights_lock);
+        }
+
+        if (fidx < 0) {
+            return waitlist_and_notify_admins(state, user_id, source, destination, day, month, year, requested);
+        }
+    }
+
+    int booked = book_seats_on_flight(state, fidx, user_id, requested, out_booking_id, out_booking_id_size, 0, 1);
+    if (booked == -5 || booked == -6) {
+        return waitlist_and_notify_admins(state, user_id, source, destination, day, month, year, requested);
+    }
+    return booked;
 }
 
 int cancel_booking_by_id(ServerState *state, const char *booking_id) {

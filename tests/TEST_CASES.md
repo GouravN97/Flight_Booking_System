@@ -15,6 +15,10 @@ make test-concurrency
 The runner starts `server_app` in a temporary directory (fresh `.db` files), launches
 `concurrent_booking_test`, then shuts the server down.
 
+Setup commands still use the documented `ADMIN_CREATE_FLIGHT admin admin123 ...` and
+`BOOK userNN ...` forms. The test harness logs in first, caches HMAC tokens, and rewrites
+those commands to the token protocol before sending.
+
 Each test uses a **pthread barrier** so all client threads send their `BOOK` command at
 the same instant. Responses are classified as:
 
@@ -22,9 +26,10 @@ the same instant. Responses are classified as:
 | --------------- | ------- |
 | `OK ` | Booking succeeded (`OK <flight>-BK####`) |
 | `ERR booking failed` | Semaphore/seat allocation lost the race |
-| `REQUESTED flight unavailable; ...` | Flight full at lookup time (also a failed booking when flight exists) |
+| `REQUESTED flight unavailable; ...` | Waitlist enqueue failed; admin creation request sent |
+| `WAITLISTED flight full; ...` | Flight full (or no capacity); user queued for the next matching route |
 
-Under heavy contention, losers may receive **either** `ERR` or `REQUESTED`. The test harness counts both as rejections. The critical invariant is the **post-condition seat count** (no overbooking).
+Under heavy contention, losers may receive **`ERR`**, **`REQUESTED`**, or **`WAITLISTED`**. The test harness counts all three as rejections. The critical invariant is the **post-condition seat count** (no overbooking).
 
 ---
 
@@ -53,7 +58,7 @@ BOOK user10 BLR DEL 15 8 2026 1
 | Count | Pattern |
 | ----- | ------- |
 | 5 | `OK CF101-BK0001` … `OK CF101-BK0005` (any order, all unique) |
-| 5 | `ERR booking failed` and/or `REQUESTED flight unavailable; ...` |
+| 5 | `ERR booking failed`, `WAITLISTED ...`, and/or `REQUESTED flight unavailable; ...` |
 
 **Post-condition verify**
 

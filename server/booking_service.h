@@ -4,6 +4,16 @@
 #include "server_state.h"
 
 #define BOOKING_ADMIN_REQUESTED 1
+#define BOOKING_WAITLISTED 2
+
+int book_seats_on_flight(ServerState *state,
+                         int flight_idx,
+                         const char *user_id,
+                         int requested,
+                         char *out_booking_id,
+                         size_t out_booking_id_size,
+                         int flights_lock_held,
+                         int persist);
 
 int find_booking_index(ServerState *state, const char *booking_id, int *flight_idx_out);
 int book_seats_for_user(ServerState *state,
