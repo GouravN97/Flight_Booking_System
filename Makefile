@@ -48,6 +48,8 @@ admin: admin_app
 
 clean:
 	rm -f server_app client_app admin_app concurrent_booking_test *.db auth.secret
+	$(MAKE) -C $(MY_DBMS_DIR) clean
+	rm -rf web/api/__pycache__
 
 reset-bookings-db:
 	rm -f bookings.db

@@ -1,6 +1,6 @@
 # HTTP API Plan (for an HTML frontend)
 
-The HTTP gateway described here is implemented in [`web/api/`](web/api/README.md) (`python3 web/api/gateway.py`). It does not change the C server, CLI clients, or storage. The goal is a JSON HTTP API that a browser-based HTML/CSS/JS frontend can call, while the existing `server_app` remains the source of truth for bookings, waitlist, auth, and persistence.
+The HTTP gateway described here is implemented in [`web/api/`](../web/api/README.md) (`python3 web/api/gateway.py`). It does not change the C server, CLI clients, or storage. The goal is a JSON HTTP API that a browser-based HTML/CSS/JS frontend can call, while the existing `server_app` remains the source of truth for bookings, waitlist, auth, and persistence.
 
 Today the system is a **line-oriented TCP protocol** on port `9090`. Browsers cannot speak that protocol. An HTTP API is the missing layer between `server_app` and a web UI.
 
@@ -319,7 +319,7 @@ Suggested repo layout (when you implement):
 web/
   api/                 # HTTP gateway
   frontend/            # static HTML/CSS/JS
-API_PLAN.md            # this file
+docs/API_PLAN.md       # this file
 ```
 
 Keep the Makefile as-is for C; add a separate `web/api` start script (for example `npm start` or `uvicorn`).

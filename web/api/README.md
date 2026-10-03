@@ -1,6 +1,6 @@
 # Flight Booking HTTP API
 
-This README describes **why** the HTTP API exists, **how** it was built, and **how to run it**. It is separate from the main project README (CLI / C server) and from [`API_PLAN.md`](../../API_PLAN.md) (the original design contract).
+This README describes **why** the HTTP API exists, **how** it was built, and **how to run it**. It is separate from the main project README (CLI / C server) and from [`API_PLAN.md`](../../docs/API_PLAN.md) (the original design contract).
 
 The API is not a second booking engine. It is a thin **HTTP gateway** in front of `server_app`.
 
@@ -204,4 +204,4 @@ Admin login uses the same default as the C server after a clean start: `admin` /
 - It does not add WebSockets or a seat-picker UI (the protocol has no per-seat user choice).
 - It does not change HMAC token format; the token is an opaque string.
 
-The HTML frontend (not included here) should store the token in `sessionStorage` and call these routes. See [`API_PLAN.md`](../../API_PLAN.md) for page-level frontend notes.
+The HTML frontend (not included here) should store the token in `sessionStorage` and call these routes. See [`API_PLAN.md`](../../docs/API_PLAN.md) for page-level frontend notes.
