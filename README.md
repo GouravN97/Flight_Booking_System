@@ -10,7 +10,7 @@ A CLI-based flight booking system written in C. Three programs work together ove
 | `admin_app`  | Admin CLI for managing flights, admins, and the shared admin feed             |
 
 
-An HTTP/JSON API for a future HTML frontend lives in [`web/api/`](web/api/README.md) (`python3 web/api/gateway.py` or `make api`). It proxies to `server_app` and does not replace the CLI clients. The design notes are in [`API_PLAN.md`](API_PLAN.md).
+An HTTP/JSON API for a future HTML frontend lives in [`web/api/`](web/api/README.md) (`python3 web/api/gateway.py` or `make api`). It proxies to `server_app` and does not replace the CLI clients. The design notes are in [`docs/API_PLAN.md`](docs/API_PLAN.md), and a conceptual walkthrough of the whole system is in [`docs/study.md`](docs/study.md).
 
 ## Requirements
 
@@ -686,7 +686,7 @@ Each file is a my_dbms table keyed by slot index (`uint32_t`). Records are fixed
 | ------------------- | --------------------------- | ------------------------------ |
 | `flights.db`        | Flight slot index           | `FlightPersist` (seats, route) |
 | `users.db`          | User slot index             | `UserEntry`                    |
-| `admins.db`         | Admin slot index            | `AdminEntry`                   |
+| `admins.db`         | Admin slot index            | `AdminPersist`                 |
 | `bookings.db`       | `flight_index * MAX_BOOKINGS_PER_FLIGHT + booking_index` | `BookingRecord` |
 | `waitlist.db`       | Waitlist slot index         | `WaitlistEntry`                |
 | `notifications.db`  | Notification slot index     | `UserNotification`             |
@@ -694,6 +694,8 @@ Each file is a my_dbms table keyed by slot index (`uint32_t`). Records are fixed
 Bookings are not stored in a single global array. Each flight has up to `MAX_BOOKINGS_PER_FLIGHT` slots in memory and in `bookings.db`. Booking IDs are flight-scoped (`F101-BK0001`), and `storage_flush_flight_bookings()` writes only the bookings for one flight after a book or cancel.
 
 Starting the server from a different directory creates or uses a different set of database files.
+
+These files are runtime data and are ignored by git; never commit `auth.secret`, since anyone holding it can mint valid tokens.
 
 **Note:** Database files use the my_dbms page format, not the older fixed-record layout. Run `make clean` before restarting if you have leftover `.db` files from a previous version. `make clean` also removes `auth.secret`.
 
@@ -747,8 +749,8 @@ The main limits are defined in `server/server_state.h` and `server/token.h`:
 Source code is grouped by role. The Makefile adds `-Iserver`, `-Iclient`, and `-Istorage` so modules can include headers by name (for example, `#include "server_state.h"`).
 
 ```text
-redux/
-├── Makefile
+Flight_Booking_System/
+├── Makefile                  # Builds server_app, client_app, admin_app; test and api targets
 ├── README.md
 ├── apps/                     # Program entry points
 │   ├── server_app.c          # Server main
@@ -772,16 +774,25 @@ redux/
 ├── storage/                  # Persistence layer
 │   ├── storage_service.c/h   # Domain-to-disk mapping
 │   └── db_handler.c/h        # Adapter over my_dbms C API
-└── my_dbms/                  # B-tree DBMS engine
-    ├── Makefile
-    ├── README.md
-    └── src/
-        ├── api/                # Public CRUD API
-        ├── app/                # Standalone DBMS shell
-        ├── btree/              # B-tree page layout and algorithms
-        ├── shell/              # REPL helpers
-        ├── sql/                # Demo SQL parser and executor
-        └── storage/            # Pager, table, cursor, row
+├── my_dbms/                  # Embedded B-tree storage engine (library only)
+│   ├── Makefile              # Optional standalone build of libmy_dbms.a
+│   ├── README.md
+│   └── src/
+│       ├── api/              # Public CRUD API (db.h)
+│       ├── btree/            # B-tree page layout and algorithms
+│       └── storage/          # Pager, table, cursor
+├── web/
+│   └── api/                  # Python HTTP/JSON gateway in front of server_app
+│       ├── gateway.py
+│       ├── protocol.py
+│       └── README.md
+├── tests/
+│   ├── concurrent_booking_test.c   # Concurrency integration harness
+│   ├── run_concurrency_tests.sh    # Runs the harness against an isolated server
+│   └── TEST_CASES.md
+└── docs/
+    ├── API_PLAN.md           # HTTP API design notes
+    └── study.md              # Conceptual study guide for the whole system
 ```
 
-Build artifacts (`server_app`, `client_app`, `admin_app`) and runtime files (`*.db`, `auth.secret`) are written to the project root.
+Build outputs (`server_app`, `client_app`, `admin_app`, `concurrent_booking_test`, `*.o`) and runtime data (`*.db`, `auth.secret`) are generated locally and ignored by git; `make clean` removes them.
