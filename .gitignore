@@ -1,0 +1,22 @@
+# Build outputs
+/server_app
+/client_app
+/admin_app
+/concurrent_booking_test
+*.o
+*.a
+/my_dbms/my_dbms
+
+# Runtime data written by server_app (created in its working directory)
+*.db
+auth.secret
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / tool state
+.codex
+.vscode/
+.idea/
+.DS_Store
